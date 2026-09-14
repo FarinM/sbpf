@@ -1224,7 +1224,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
 
     fn emit_aligned_translation(&mut self, len: u64, is_store: bool, decode_immediate: bool) {
         let mut fallback = Vec::new();
-        for reg in [RAX, RCX, RDX, REGISTER_SCRATCH] {
+        for reg in [RAX, RCX, REGISTER_SCRATCH] {
             self.emit_ins(X86Instruction::push(reg, None));
         }
         self.emit_ins(X86Instruction::load(OperandSize::S64, REGISTER_PTR_TO_VM, RAX, X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::MemoryMapping))));
@@ -1233,8 +1233,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x3b, RCX, RAX, Some(X86IndirectAccess::Offset(mem::offset_of!(MemoryMapping, jit_regions_len) as i32))));
         fallback.push(self.emit_local_jump(0x83)); // index >= length (also handles a disabled view)
         self.emit_ins(X86Instruction::load(OperandSize::S64, RAX, RAX, X86IndirectAccess::Offset(mem::offset_of!(MemoryMapping, jit_regions) as i32)));
-        self.emit_ins(X86Instruction::load_immediate(RDX, mem::size_of::<MemoryRegion>() as i64));
-        self.emit_ins(X86Instruction::alu_escaped(OperandSize::S64, 1, 0xaf, RCX, RDX, None));
+        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x69, RCX as u8, RCX, mem::size_of::<MemoryRegion>() as i64, None));
         self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, RCX, RAX, None));
         if is_store {
             self.emit_ins(X86Instruction::cmp_immediate(OperandSize::S8, RAX, 0, Some(X86IndirectAccess::Offset(mem::offset_of!(MemoryRegion, is_writable) as i32))));
@@ -1244,24 +1243,23 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         fallback.push(self.emit_local_jump(0x82)); // address precedes the region's actual start
         self.emit_ins(X86Instruction::test(OperandSize::S64, REGISTER_SCRATCH, RAX, Some(X86IndirectAccess::Offset(mem::offset_of!(MemoryRegion, gap_bit) as i32))));
         fallback.push(self.emit_local_jump(0x85));
-        self.emit_ins(X86Instruction::load(OperandSize::S64, RAX, RCX, X86IndirectAccess::Offset(mem::offset_of!(MemoryRegion, gap_mask) as i32)));
-        self.emit_ins(X86Instruction::mov(OperandSize::S64, REGISTER_SCRATCH, RDX));
-        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x21, RCX, RDX, None));
-        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 6, RCX, -1, None));
-        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x21, RCX, REGISTER_SCRATCH, None));
-        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xc1, 5, RDX, 1, None));
-        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x09, RDX, REGISTER_SCRATCH, None));
-        self.emit_ins(X86Instruction::mov(OperandSize::S64, REGISTER_SCRATCH, RDX));
-        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RDX, len as i64, None));
+        // With the gap bit clear, high / 2 and low do not overlap, where
+        // high = offset & gap_mask. Thus offset - high / 2 = high / 2 | low.
+        self.emit_ins(X86Instruction::mov(OperandSize::S64, REGISTER_SCRATCH, RCX));
+        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x23, RCX, RAX, Some(X86IndirectAccess::Offset(mem::offset_of!(MemoryRegion, gap_mask) as i32))));
+        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xc1, 5, RCX, 1, None));
+        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x29, RCX, REGISTER_SCRATCH, None));
+        self.emit_ins(X86Instruction::mov(OperandSize::S64, REGISTER_SCRATCH, RCX));
+        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RCX, len as i64, None));
         fallback.push(self.emit_local_jump(0x82)); // extent overflow
-        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x3b, RDX, RAX, Some(X86IndirectAccess::Offset(mem::offset_of!(MemoryRegion, len) as i32))));
+        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x3b, RCX, RAX, Some(X86IndirectAccess::Offset(mem::offset_of!(MemoryRegion, len) as i32))));
         fallback.push(self.emit_local_jump(0x87));
         self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x03, REGISTER_SCRATCH, RAX, Some(X86IndirectAccess::Offset(mem::offset_of!(MemoryRegion, host_addr) as i32))));
         let size = match len { 1 => OperandSize::S8, 2 => OperandSize::S16, 4 => OperandSize::S32, 8 => OperandSize::S64, _ => unreachable!() };
         if is_store {
             // Entry RSP points to the saved PC, sixteen bytes below the access site's RSP.
-            // Four pushes put its saved store value (caller RSP - 96) at this RSP - 48.
-            self.emit_ins(X86Instruction::load(OperandSize::S64, RSP, RCX, X86IndirectAccess::OffsetIndexShift(-48, RSP, 0)));
+            // Three pushes put its saved store value (caller RSP - 96) at this RSP - 56.
+            self.emit_ins(X86Instruction::load(OperandSize::S64, RSP, RCX, X86IndirectAccess::OffsetIndexShift(-56, RSP, 0)));
             if decode_immediate {
                 self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RCX, self.immediate_value_key as i32 as i64, None));
             }
@@ -1271,7 +1269,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             self.emit_ins(X86Instruction::load(size, REGISTER_SCRATCH, REGISTER_SCRATCH, X86IndirectAccess::Offset(0)));
         }
         self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RSP, 8, None));
-        for reg in [RDX, RCX, RAX] {
+        for reg in [RCX, RAX] {
             self.emit_ins(X86Instruction::pop(reg));
         }
         // Skip the PC slot without overwriting the load result in R11, then return directly
@@ -1281,7 +1279,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         for displacement in fallback {
             self.resolve_local_jump(displacement);
         }
-        for reg in [REGISTER_SCRATCH, RDX, RCX, RAX] {
+        for reg in [REGISTER_SCRATCH, RCX, RAX] {
             self.emit_ins(X86Instruction::pop(reg));
         }
     }
@@ -1903,6 +1901,24 @@ mod shared_translation_tests {
             }
         }
         assert!(compiler.offset_in_text_section <= ALIGNED_TRANSLATION_CODE_RESERVE);
+    }
+
+    #[test]
+    fn immediate_multiply_encodes_both_register_operands() {
+        let executable = executable(1, 0);
+        let mut compiler = JitCompiler::new(&executable).unwrap();
+        compiler.emit_ins(X86Instruction::alu_immediate(
+            OperandSize::S64,
+            0x69,
+            RCX as u8,
+            RCX,
+            56,
+            None,
+        ));
+        assert_eq!(
+            &compiler.result.text_section[..compiler.offset_in_text_section],
+            &[0x48, 0x69, 0xc9, 56, 0, 0, 0],
+        );
     }
 
     #[test]
