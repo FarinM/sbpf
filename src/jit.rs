@@ -1223,26 +1223,34 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
     }
 
     fn emit_aligned_translation(&mut self, len: u64, is_store: bool, decode_immediate: bool) {
-        let mut fallback = Vec::new();
-        for reg in [RAX, RCX, REGISTER_SCRATCH] {
-            self.emit_ins(X86Instruction::push(reg, None));
+        // R11 carries the guest address on entry and the load result on return.
+        // Preserve RAX and RCX. Entry RSP points to the return address; the PC at RSP - 8
+        // and store value at RSP - 88 stay untouched until the fallback.
+        // These spill slots are inside the ABI red zone; no call occurs before
+        // restoring them, and they do not overlap the caller's saved values.
+        for (reg, offset) in [(RAX, -16), (RCX, -24)] {
+            self.emit_ins(X86Instruction::store(OperandSize::S64, reg, RSP, X86IndirectAccess::OffsetIndexShift(offset, RSP, 0)));
         }
         self.emit_ins(X86Instruction::load(OperandSize::S64, REGISTER_PTR_TO_VM, RAX, X86IndirectAccess::Offset(self.slot_in_vm(RuntimeEnvironmentSlot::MemoryMapping))));
         self.emit_ins(X86Instruction::mov(OperandSize::S64, REGISTER_SCRATCH, RCX));
         self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xc1, 5, RCX, ebpf::VIRTUAL_ADDRESS_BITS as i64, None));
         self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x3b, RCX, RAX, Some(X86IndirectAccess::Offset(mem::offset_of!(MemoryMapping, jit_regions_len) as i32))));
-        fallback.push(self.emit_local_jump(0x83)); // index >= length (also handles a disabled view)
+        let region_miss = self.emit_local_jump(0x83); // index >= length (also handles a disabled view)
         self.emit_ins(X86Instruction::load(OperandSize::S64, RAX, RAX, X86IndirectAccess::Offset(mem::offset_of!(MemoryMapping, jit_regions) as i32)));
         self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x69, RCX as u8, RCX, mem::size_of::<MemoryRegion>() as i64, None));
         self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, RCX, RAX, None));
-        if is_store {
+        let readonly_store = if is_store {
             self.emit_ins(X86Instruction::cmp_immediate(OperandSize::S8, RAX, 0, Some(X86IndirectAccess::Offset(mem::offset_of!(MemoryRegion, is_writable) as i32))));
-            fallback.push(self.emit_local_jump(0x84));
-        }
+            Some(self.emit_local_jump(0x84))
+        } else {
+            None
+        };
+        // Earlier failures have not modified the guest address and need no R11 spill.
+        self.emit_ins(X86Instruction::store(OperandSize::S64, REGISTER_SCRATCH, RSP, X86IndirectAccess::OffsetIndexShift(-32, RSP, 0)));
         self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x2b, REGISTER_SCRATCH, RAX, Some(X86IndirectAccess::Offset(mem::offset_of!(MemoryRegion, vm_addr) as i32))));
-        fallback.push(self.emit_local_jump(0x82)); // address precedes the region's actual start
+        let before_region = self.emit_local_jump(0x82); // address precedes the region's actual start
         self.emit_ins(X86Instruction::test(OperandSize::S64, REGISTER_SCRATCH, RAX, Some(X86IndirectAccess::Offset(mem::offset_of!(MemoryRegion, gap_bit) as i32))));
-        fallback.push(self.emit_local_jump(0x85));
+        let stack_gap = self.emit_local_jump(0x85);
         // With the gap bit clear, high / 2 and low do not overlap, where
         // high = offset & gap_mask. Thus offset - high / 2 = high / 2 | low.
         self.emit_ins(X86Instruction::mov(OperandSize::S64, REGISTER_SCRATCH, RCX));
@@ -1251,15 +1259,13 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x29, RCX, REGISTER_SCRATCH, None));
         self.emit_ins(X86Instruction::mov(OperandSize::S64, REGISTER_SCRATCH, RCX));
         self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RCX, len as i64, None));
-        fallback.push(self.emit_local_jump(0x82)); // extent overflow
+        let extent_overflow = self.emit_local_jump(0x82); // extent overflow
         self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x3b, RCX, RAX, Some(X86IndirectAccess::Offset(mem::offset_of!(MemoryRegion, len) as i32))));
-        fallback.push(self.emit_local_jump(0x87));
+        let out_of_bounds = self.emit_local_jump(0x87);
         self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x03, REGISTER_SCRATCH, RAX, Some(X86IndirectAccess::Offset(mem::offset_of!(MemoryRegion, host_addr) as i32))));
         let size = match len { 1 => OperandSize::S8, 2 => OperandSize::S16, 4 => OperandSize::S32, 8 => OperandSize::S64, _ => unreachable!() };
         if is_store {
-            // Entry RSP points to the saved PC, sixteen bytes below the access site's RSP.
-            // Three pushes put its saved store value (caller RSP - 96) at this RSP - 56.
-            self.emit_ins(X86Instruction::load(OperandSize::S64, RSP, RCX, X86IndirectAccess::OffsetIndexShift(-56, RSP, 0)));
+            self.emit_ins(X86Instruction::load(OperandSize::S64, RSP, RCX, X86IndirectAccess::OffsetIndexShift(-88, RSP, 0)));
             if decode_immediate {
                 self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RCX, self.immediate_value_key as i32 as i64, None));
             }
@@ -1268,19 +1274,21 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         } else {
             self.emit_ins(X86Instruction::load(size, REGISTER_SCRATCH, REGISTER_SCRATCH, X86IndirectAccess::Offset(0)));
         }
-        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RSP, 8, None));
-        for reg in [RCX, RAX] {
-            self.emit_ins(X86Instruction::pop(reg));
+        for (reg, offset) in [(RCX, -24), (RAX, -16)] {
+            self.emit_ins(X86Instruction::load(OperandSize::S64, RSP, reg, X86IndirectAccess::OffsetIndexShift(offset, RSP, 0)));
         }
-        // Skip the PC slot without overwriting the load result in R11, then return directly
-        // to the access site. A failed guard restores R11 and falls through to the Rust helper.
-        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RSP, 8, None));
+        // Return without reserving or popping the PC slot on successful accesses.
         self.emit_ins(X86Instruction::return_near());
-        for displacement in fallback {
+        for displacement in [before_region, stack_gap, extent_overflow, out_of_bounds] {
             self.resolve_local_jump(displacement);
         }
-        for reg in [REGISTER_SCRATCH, RCX, RAX] {
-            self.emit_ins(X86Instruction::pop(reg));
+        self.emit_ins(X86Instruction::load(OperandSize::S64, RSP, REGISTER_SCRATCH, X86IndirectAccess::OffsetIndexShift(-32, RSP, 0)));
+        self.resolve_local_jump(region_miss);
+        if let Some(displacement) = readonly_store {
+            self.resolve_local_jump(displacement);
+        }
+        for (reg, offset) in [(RCX, -24), (RAX, -16)] {
+            self.emit_ins(X86Instruction::load(OperandSize::S64, RSP, reg, X86IndirectAccess::OffsetIndexShift(offset, RSP, 0)));
         }
     }
 
@@ -1754,13 +1762,13 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         ] {
             let target_offset = *anchor_base + len.trailing_zeros() as usize;
             self.set_anchor(ANCHOR_TRANSLATE_MEMORY_ADDRESS + target_offset);
-            // skip over the pc slot pushed by the caller, we'll pop it before returning
-            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 5, RSP, 8, None)); // RSP -= 8
             if self.enable_aligned_translation {
                 let start = self.offset_in_text_section;
                 self.emit_aligned_translation(*len as u64, *anchor_base != 0, *anchor_base == 8);
                 debug_assert!(self.offset_in_text_section - start <= ALIGNED_TRANSLATION_CODE_RESERVE / 12);
             }
+            // skip over the pc slot pushed by the caller, we'll pop it before returning
+            self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 5, RSP, 8, None)); // RSP -= 8
             // call MemoryMapping::(load|store) storing the result in RuntimeEnvironmentSlot::ProgramResult
             if *anchor_base == 0 { // AccessType::Load
                 let load = match len {

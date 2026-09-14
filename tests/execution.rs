@@ -3948,6 +3948,60 @@ fn test_symbol_relocation() {
 }
 
 #[test]
+fn test_readonly_translation_fallback_preserves_address_and_store_value() {
+    let config = Config {
+        aligned_memory_mapping: true,
+        enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V0,
+        noop_instruction_rate: 1,
+        ..Config::default()
+    };
+    let executable = assemble::<TestContextObject>(
+        "stdw [r1+8], -1985229329\nldxdw r0, [r1+8]\nexit",
+        Arc::new(BuiltinProgram::new_loader(config)),
+    )
+    .unwrap();
+    executable.verify::<RequisiteVerifier>().unwrap();
+    executable.jit_compile().unwrap();
+    let input = [0x5au8; 32];
+    let mut replacement = [0u8; 32];
+    let replacement_ptr = &raw mut replacement[..];
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+    let callback_calls = calls.clone();
+    let handler = Box::new(move |region: &mut MemoryRegion, _, access, address, len| {
+        assert_eq!(
+            (access, address, len),
+            (AccessType::Store, ebpf::MM_INPUT_START + 8, 8)
+        );
+        callback_calls.set(callback_calls.get() + 1);
+        // The replacement remains live through execution and satisfies the
+        // original region's size and virtual-address constraints.
+        unsafe { region.redirect(replacement_ptr) };
+    });
+    let mut context = TestContextObject::new(3);
+    create_vm!(
+        vm,
+        &executable,
+        &mut context,
+        stack,
+        heap,
+        vec![MemoryRegion::new(
+            &raw const input[..],
+            ebpf::MM_INPUT_START
+        )],
+        Some(handler)
+    );
+    let (count, result) = vm.execute_program(&executable, &mut ExecutionMode::Jit, &mut []);
+    assert_eq!(count, 3);
+    assert_eq!(vm.context().remaining, 0);
+    assert_eq!(result.unwrap(), -1985229329i64 as u64);
+    assert_eq!(calls.get(), 1);
+    assert_eq!(input, [0x5a; 32]);
+    assert_eq!(&replacement[8..16], &(-1985229329i64).to_le_bytes());
+    assert_eq!(&replacement[..8], &[0; 8]);
+    assert_eq!(&replacement[16..], &[0; 16]);
+}
+
+#[test]
 fn test_gapped_translation_preserves_registers() {
     let config = Config {
         aligned_memory_mapping: true,
