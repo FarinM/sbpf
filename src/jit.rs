@@ -1316,10 +1316,13 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
             Value::RegisterPlusConstant64(reg, constant, user_provided) => {
                 if user_provided && self.should_sanitize_constant(constant) {
                     self.emit_sanitized_load_immediate(REGISTER_SCRATCH, constant);
+                    self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, reg, REGISTER_SCRATCH, None)); // add R11, reg
+                } else if let Ok(offset) = i32::try_from(constant) {
+                    self.emit_ins(X86Instruction::lea(OperandSize::S64, reg, REGISTER_SCRATCH, Some(X86IndirectAccess::OffsetIndexShift(offset, RSP, 0))));
                 } else {
                     self.emit_ins(X86Instruction::load_immediate(REGISTER_SCRATCH, constant));
+                    self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, reg, REGISTER_SCRATCH, None));
                 }
-                self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, reg, REGISTER_SCRATCH, None));
             },
             _ => {
                 #[cfg(debug_assertions)]
