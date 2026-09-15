@@ -255,10 +255,14 @@ pub struct MemoryRegion {
     pub(crate) vm_addr: u64,
     pub(crate) gap_mask: u64,
     pub(crate) gap_bit: u64,
+    /// Region relative offsets below this are mapped without gap translation
+    pub(crate) identity_end: u64,
     /// Size of regular gaps as bit shift (63 means this region is continuous)
     vm_gap_shift: u8,
     /// User defined payload for the [AccessViolationHandler]
     pub access_violation_handler_payload: Option<u16>,
+    /// Pads the region to 64 bytes so the JIT can index the region table with a shift
+    _padding: [u8; 8],
 }
 
 impl MemoryRegion {
@@ -288,8 +292,10 @@ impl MemoryRegion {
             } else {
                 1 << vm_gap_shift
             },
+            identity_end: 1 << vm_gap_shift,
             vm_gap_shift,
             access_violation_handler_payload: None,
+            _padding: [0; 8],
         }
     }
 
@@ -2015,5 +2021,33 @@ mod test {
         };
 
         assert!(matches!(mapping.ty, MemoryMappingType::Aligned(_)));
+    }
+
+    #[test]
+    fn identity_end_marks_offsets_translated_as_is() {
+        let mem = [0u8; 64];
+        for gap in [0, 1, 2, 4096] {
+            let gapped = MemoryRegion::new_gapped(&raw const mem[..], ebpf::MM_INPUT_START, gap);
+            let last = gapped.identity_end.min(mem.len() as u64).saturating_sub(1);
+            for offset in [0, 1, last] {
+                if offset >= gapped.identity_end {
+                    continue;
+                }
+                let host = gapped
+                    .vm_to_host_buffer(ebpf::MM_INPUT_START + offset, 1)
+                    .unwrap();
+                assert_eq!(
+                    host.ptr().cast::<u8>(),
+                    mem.as_ptr().wrapping_add(offset as usize),
+                    "gap {gap} offset {offset}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn memory_region_is_one_cache_line() {
+        assert_eq!(std::mem::size_of::<MemoryRegion>(), 64);
     }
 }

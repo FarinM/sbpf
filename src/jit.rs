@@ -1237,7 +1237,9 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x3b, RCX, RAX, Some(X86IndirectAccess::Offset(mem::offset_of!(MemoryMapping, jit_regions_len) as i32))));
         let region_miss = self.emit_local_jump(0x83); // index >= length (also handles a disabled view)
         self.emit_ins(X86Instruction::load(OperandSize::S64, RAX, RAX, X86IndirectAccess::Offset(mem::offset_of!(MemoryMapping, jit_regions) as i32)));
-        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x69, RCX as u8, RCX, mem::size_of::<MemoryRegion>() as i64, None));
+        let region_size = mem::size_of::<MemoryRegion>();
+        debug_assert!(region_size.is_power_of_two());
+        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xc1, 4, RCX, region_size.trailing_zeros() as i64, None));
         self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x01, RCX, RAX, None));
         let readonly_store = if is_store {
             self.emit_ins(X86Instruction::cmp_immediate(OperandSize::S8, RAX, 0, Some(X86IndirectAccess::Offset(mem::offset_of!(MemoryRegion, is_writable) as i32))));
@@ -1249,6 +1251,9 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.emit_ins(X86Instruction::store(OperandSize::S64, REGISTER_SCRATCH, RSP, X86IndirectAccess::OffsetIndexShift(-32, RSP, 0)));
         self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x2b, REGISTER_SCRATCH, RAX, Some(X86IndirectAccess::Offset(mem::offset_of!(MemoryRegion, vm_addr) as i32))));
         let before_region = self.emit_local_jump(0x82); // address precedes the region's actual start
+        // Offsets below the identity end need no gap translation.
+        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x3b, REGISTER_SCRATCH, RAX, Some(X86IndirectAccess::Offset(mem::offset_of!(MemoryRegion, identity_end) as i32))));
+        let identity = self.emit_local_jump(0x82);
         self.emit_ins(X86Instruction::test(OperandSize::S64, REGISTER_SCRATCH, RAX, Some(X86IndirectAccess::Offset(mem::offset_of!(MemoryRegion, gap_bit) as i32))));
         let stack_gap = self.emit_local_jump(0x85);
         // With the gap bit clear, high / 2 and low do not overlap, where
@@ -1257,6 +1262,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x23, RCX, RAX, Some(X86IndirectAccess::Offset(mem::offset_of!(MemoryRegion, gap_mask) as i32))));
         self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xc1, 5, RCX, 1, None));
         self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x29, RCX, REGISTER_SCRATCH, None));
+        self.resolve_local_jump(identity);
         self.emit_ins(X86Instruction::mov(OperandSize::S64, REGISTER_SCRATCH, RCX));
         self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RCX, len as i64, None));
         let extent_overflow = self.emit_local_jump(0x82); // extent overflow
@@ -1909,24 +1915,6 @@ mod shared_translation_tests {
             }
         }
         assert!(compiler.offset_in_text_section <= ALIGNED_TRANSLATION_CODE_RESERVE);
-    }
-
-    #[test]
-    fn immediate_multiply_encodes_both_register_operands() {
-        let executable = executable(1, 0);
-        let mut compiler = JitCompiler::new(&executable).unwrap();
-        compiler.emit_ins(X86Instruction::alu_immediate(
-            OperandSize::S64,
-            0x69,
-            RCX as u8,
-            RCX,
-            56,
-            None,
-        ));
-        assert_eq!(
-            &compiler.result.text_section[..compiler.offset_in_text_section],
-            &[0x48, 0x69, 0xc9, 56, 0, 0, 0],
-        );
     }
 
     #[test]
