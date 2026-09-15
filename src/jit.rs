@@ -1263,11 +1263,11 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xc1, 5, RCX, 1, None));
         self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x29, RCX, REGISTER_SCRATCH, None));
         self.resolve_local_jump(identity);
-        self.emit_ins(X86Instruction::mov(OperandSize::S64, REGISTER_SCRATCH, RCX));
-        self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0x81, 0, RCX, len as i64, None));
-        let extent_overflow = self.emit_local_jump(0x82); // extent overflow
-        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x3b, RCX, RAX, Some(X86IndirectAccess::Offset(mem::offset_of!(MemoryRegion, len) as i32))));
-        let out_of_bounds = self.emit_local_jump(0x87);
+        // Offsets stay below 2^63, so the width bias cannot wrap and a single
+        // signed comparison against the region's eight byte limit suffices.
+        self.emit_ins(X86Instruction::lea(OperandSize::S64, REGISTER_SCRATCH, RCX, Some(X86IndirectAccess::OffsetIndexShift(len as i32 - 8, RSP, 0))));
+        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x3b, RCX, RAX, Some(X86IndirectAccess::Offset(mem::offset_of!(MemoryRegion, extent_limit) as i32))));
+        let out_of_bounds = self.emit_local_jump(0x8f); // signed offset > extent limit
         self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x03, REGISTER_SCRATCH, RAX, Some(X86IndirectAccess::Offset(mem::offset_of!(MemoryRegion, host_addr) as i32))));
         let size = match len { 1 => OperandSize::S8, 2 => OperandSize::S16, 4 => OperandSize::S32, 8 => OperandSize::S64, _ => unreachable!() };
         if is_store {
@@ -1285,7 +1285,7 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         }
         // Return without reserving or popping the PC slot on successful accesses.
         self.emit_ins(X86Instruction::return_near());
-        for displacement in [before_region, stack_gap, extent_overflow, out_of_bounds] {
+        for displacement in [before_region, stack_gap, out_of_bounds] {
             self.resolve_local_jump(displacement);
         }
         self.emit_ins(X86Instruction::load(OperandSize::S64, RSP, REGISTER_SCRATCH, X86IndirectAccess::OffsetIndexShift(-32, RSP, 0)));

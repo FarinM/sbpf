@@ -257,12 +257,12 @@ pub struct MemoryRegion {
     pub(crate) gap_bit: u64,
     /// Region relative offsets below this are mapped without gap translation
     pub(crate) identity_end: u64,
+    /// Host length minus the widest access, for the JIT extent check
+    pub(crate) extent_limit: u64,
     /// Size of regular gaps as bit shift (63 means this region is continuous)
     vm_gap_shift: u8,
     /// User defined payload for the [AccessViolationHandler]
     pub access_violation_handler_payload: Option<u16>,
-    /// Pads the region to 64 bytes so the JIT can index the region table with a shift
-    _padding: [u8; 8],
 }
 
 impl MemoryRegion {
@@ -293,9 +293,9 @@ impl MemoryRegion {
                 1 << vm_gap_shift
             },
             identity_end: 1 << vm_gap_shift,
+            extent_limit: (host.len() as u64).wrapping_sub(8),
             vm_gap_shift,
             access_violation_handler_payload: None,
-            _padding: [0; 8],
         }
     }
 
@@ -334,6 +334,7 @@ impl MemoryRegion {
         let host = host.host();
         self.host_addr = host.ptr().cast_mut().cast();
         self.len = host.len();
+        self.extent_limit = (host.len() as u64).wrapping_sub(8);
         self.is_writable = host.is_mutable();
     }
 
@@ -666,6 +667,11 @@ impl AlignedMemoryMapping {
                 .vm_addr
                 .checked_shr(ebpf::VIRTUAL_ADDRESS_BITS as u32)
                 .unwrap_or(0) as usize;
+            // A region index is bounded by this length, so keeping it below 2^31 bounds
+            // every region relative offset (and thus every translated offset) below 2^63.
+            if actual_region_index >= 1 << 31 {
+                return Err(EbpfError::InvalidMemoryRegion(actual_region_index));
+            }
             if actual_region_index > expected_region_index {
                 self.regions.insert(
                     expected_region_index,
@@ -2049,5 +2055,16 @@ mod test {
     #[cfg(target_pointer_width = "64")]
     fn memory_region_is_one_cache_line() {
         assert_eq!(std::mem::size_of::<MemoryRegion>(), 64);
+    }
+
+    #[test]
+    fn extent_limit_tracks_the_host_length() {
+        let mem = [0u8; 16];
+        let mut region = MemoryRegion::new(&raw const mem[..], ebpf::MM_INPUT_START);
+        assert_eq!(region.extent_limit, 8);
+        unsafe { region.redirect(&raw const mem[..12]) };
+        assert_eq!(region.extent_limit, 4);
+        unsafe { region.redirect(&raw const mem[..4]) };
+        assert_eq!(region.extent_limit as i64, -4);
     }
 }
