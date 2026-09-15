@@ -1251,9 +1251,6 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.emit_ins(X86Instruction::store(OperandSize::S64, REGISTER_SCRATCH, RSP, X86IndirectAccess::OffsetIndexShift(-32, RSP, 0)));
         self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x2b, REGISTER_SCRATCH, RAX, Some(X86IndirectAccess::Offset(mem::offset_of!(MemoryRegion, vm_addr) as i32))));
         let before_region = self.emit_local_jump(0x82); // address precedes the region's actual start
-        // Offsets below the identity end need no gap translation.
-        self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x3b, REGISTER_SCRATCH, RAX, Some(X86IndirectAccess::Offset(mem::offset_of!(MemoryRegion, identity_end) as i32))));
-        let identity = self.emit_local_jump(0x82);
         self.emit_ins(X86Instruction::test(OperandSize::S64, REGISTER_SCRATCH, RAX, Some(X86IndirectAccess::Offset(mem::offset_of!(MemoryRegion, gap_bit) as i32))));
         let stack_gap = self.emit_local_jump(0x85);
         // With the gap bit clear, high / 2 and low do not overlap, where
@@ -1262,7 +1259,6 @@ impl<'a, C: ContextObject> JitCompiler<'a, C> {
         self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x23, RCX, RAX, Some(X86IndirectAccess::Offset(mem::offset_of!(MemoryRegion, gap_mask) as i32))));
         self.emit_ins(X86Instruction::alu_immediate(OperandSize::S64, 0xc1, 5, RCX, 1, None));
         self.emit_ins(X86Instruction::alu(OperandSize::S64, 0x29, RCX, REGISTER_SCRATCH, None));
-        self.resolve_local_jump(identity);
         // Offsets stay below 2^63, so the width bias cannot wrap and a single
         // signed comparison against the region's eight byte limit suffices.
         self.emit_ins(X86Instruction::lea(OperandSize::S64, REGISTER_SCRATCH, RCX, Some(X86IndirectAccess::OffsetIndexShift(len as i32 - 8, RSP, 0))));
